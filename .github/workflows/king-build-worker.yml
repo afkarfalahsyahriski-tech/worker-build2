@@ -1,0 +1,392 @@
+name: KING Build Worker
+run-name: "KING BUILD ${{ inputs.jobId }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Unique build job ID
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: JSON build payload
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Satu repository hanya menjalankan satu build pada satu waktu.
+concurrency:
+  group: king-build-worker-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD_JSON: ${{ inputs.payload }}
+
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Parse build payload
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, json, os
+
+          payload = json.loads(os.environ.get("PAYLOAD_JSON", "{}"))
+          mode = str(payload.get("mode", "zip")).strip().lower()
+          if mode not in {"zip", "url", "doctor"}:
+              raise SystemExit(f"Unsupported mode: {mode}")
+
+          build_type = str(payload.get("buildType", "release")).strip().lower()
+          if build_type not in {"debug", "release"}:
+              build_type = "release"
+
+          values = {
+              "BUILD_MODE": mode,
+              "BUILD_TYPE": build_type,
+              "SOURCE_URL": str(payload.get("url", "")).strip(),
+              "SOURCE_ASSET_ID": str(payload.get("assetId", "")).strip(),
+              "SOURCE_REPO": str(payload.get("sourceRepo", "")).strip(),
+              "SOURCE_ASSET_NAME_B64": base64.b64encode(str(payload.get("assetName", "project.zip")).encode()).decode(),
+              "ICON_URL": str(payload.get("iconUrl", "")).strip(),
+              "APP_NAME_B64": base64.b64encode(str(payload.get("appName", "KING Web App")).encode()).decode(),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+          PY
+
+      - name: Check Flutter and Android environment
+        shell: bash
+        run: |
+          set -e
+          flutter --version
+          java -version
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          fi
+
+          flutter doctor -v || true
+
+      - name: Worker self-test build
+        if: env.BUILD_MODE == 'doctor'
+        shell: bash
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/king_worker_test"
+          flutter create --platforms=android --project-name king_worker_test "$RUNNER_TEMP/king_worker_test"
+          cd "$RUNNER_TEMP/king_worker_test"
+          timeout --foreground 10m flutter pub get
+          timeout --foreground 25m flutter build apk --release --no-pub
+          test -s build/app/outputs/flutter-apk/app-release.apk
+          echo "Worker self-test APK berhasil dibuat."
+
+      - name: Download and prepare Flutter project
+        if: env.BUILD_MODE == 'zip'
+        shell: bash
+        run: |
+          set -e
+          if [ -z "$SOURCE_ASSET_ID" ] && [ -z "$SOURCE_URL" ]; then
+            echo "Sumber ZIP kosong: assetId dan URL tidak tersedia" >&2
+            exit 20
+          fi
+
+          rm -rf "$RUNNER_TEMP/king_source"
+          mkdir -p "$RUNNER_TEMP/king_source"
+          rm -f "$RUNNER_TEMP/project.zip"
+
+          if [ -n "$SOURCE_ASSET_ID" ]; then
+            REPO="${SOURCE_REPO:-${{ github.repository }}}"
+            API_URL="https://api.github.com/repos/${REPO}/releases/assets/${SOURCE_ASSET_ID}"
+            echo "Mengunduh source ZIP melalui GitHub Release Asset API: ${REPO}#${SOURCE_ASSET_ID}"
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 10 --retry-delay 2 --retry-max-time 300 \
+              --connect-timeout 30 --max-time 600 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -o "$RUNNER_TEMP/project.zip" "$API_URL"
+          else
+            echo "Asset ID tidak tersedia; memakai URL release sebagai fallback."
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 10 --retry-delay 2 --retry-max-time 300 \
+              --connect-timeout 30 --max-time 600 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -o "$RUNNER_TEMP/project.zip" "$SOURCE_URL"
+          fi
+
+          if [ ! -s "$RUNNER_TEMP/project.zip" ]; then
+            echo "ZIP hasil download kosong" >&2
+            exit 22
+          fi
+          echo "Source ZIP berhasil diunduh: $(stat -c '%s bytes' "$RUNNER_TEMP/project.zip")"
+          if ! unzip -tq "$RUNNER_TEMP/project.zip" >/dev/null; then
+            echo "File source yang diterima bukan ZIP valid. Periksa token/release asset." >&2
+            file "$RUNNER_TEMP/project.zip" || true
+            exit 23
+          fi
+
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$RUNNER_TEMP/king_source"
+
+          PUBSPEC="$(find "$RUNNER_TEMP/king_source" -type f -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml tidak ditemukan di ZIP" >&2
+            exit 21
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          cd "$PROJECT_DIR"
+          if [ ! -d android ]; then
+            flutter create --platforms=android .
+          fi
+          timeout --foreground 10m flutter pub get
+
+      - name: Generate WebView application
+        if: env.BUILD_MODE == 'url'
+        shell: bash
+        run: |
+          set -e
+          if [ -z "$SOURCE_URL" ]; then
+            echo "URL website kosong" >&2
+            exit 30
+          fi
+
+          APP_DIR="$RUNNER_TEMP/king_webapp"
+          rm -rf "$APP_DIR"
+          flutter create --platforms=android --org com.kingbuild --project-name king_webapp "$APP_DIR"
+          echo "PROJECT_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          cd "$APP_DIR"
+
+          flutter pub add webview_flutter
+
+          python3 - <<'PY'
+          import base64, html, json, os, pathlib, re
+
+          project = pathlib.Path(os.environ["RUNNER_TEMP"]) / "king_webapp"
+          app_name = base64.b64decode(os.environ["APP_NAME_B64"]).decode("utf-8", "replace").strip() or "KING Web App"
+          web_url = os.environ["SOURCE_URL"].strip()
+
+          dart = f'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const KingWebApplication());
+          }}
+
+          class KingWebApplication extends StatelessWidget {{
+            const KingWebApplication({{super.key}});
+
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: {json.dumps(app_name)},
+                theme: ThemeData(useMaterial3: true),
+                home: const KingWebScreen(),
+              );
+            }}
+          }}
+
+          class KingWebScreen extends StatefulWidget {{
+            const KingWebScreen({{super.key}});
+
+            @override
+            State<KingWebScreen> createState() => _KingWebScreenState();
+          }}
+
+          class _KingWebScreenState extends State<KingWebScreen> {{
+            late final WebViewController controller;
+            int loadingProgress = 0;
+
+            @override
+            void initState() {{
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onProgress: (value) => setState(() => loadingProgress = value),
+                  ),
+                )
+                ..loadRequest(Uri.parse({json.dumps(web_url)}));
+            }}
+
+            @override
+            Widget build(BuildContext context) {{
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(controller: controller),
+                      if (loadingProgress < 100)
+                        LinearProgressIndicator(value: loadingProgress / 100),
+                    ],
+                  ),
+                ),
+              );
+            }}
+          }}
+          '''
+          dart = "\n".join(line.lstrip() for line in dart.splitlines()) + "\n"
+          (project / "lib" / "main.dart").write_text(dart, encoding="utf-8")
+
+          manifest_path = project / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+          manifest = manifest_path.read_text(encoding="utf-8")
+          if "android.permission.INTERNET" not in manifest:
+              close = manifest.find(">")
+              manifest = manifest[:close+1] + '\n    <uses-permission android:name="android.permission.INTERNET" />' + manifest[close+1:]
+          manifest = re.sub(r'android:label="[^"]*"', f'android:label="{html.escape(app_name, quote=True)}"', manifest, count=1)
+          manifest_path.write_text(manifest, encoding="utf-8")
+          PY
+
+          if [ -n "$ICON_URL" ]; then
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 3 --retry-max-time 180 \
+              --connect-timeout 30 --max-time 300 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -o "$RUNNER_TEMP/king_icon" "$ICON_URL" || true
+
+            if [ -s "$RUNNER_TEMP/king_icon" ]; then
+              python3 -m pip install --disable-pip-version-check --quiet --user pillow
+              python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageOps
+          import os
+
+          src = Path(os.environ["RUNNER_TEMP"]) / "king_icon"
+          root = Path(os.environ["RUNNER_TEMP"]) / "king_webapp" / "android" / "app" / "src" / "main" / "res"
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+          image = Image.open(src).convert("RGBA")
+          image = ImageOps.fit(image, (512, 512), method=Image.Resampling.LANCZOS)
+          for folder, size in sizes.items():
+              target = root / folder
+              target.mkdir(parents=True, exist_ok=True)
+              image.resize((size, size), Image.Resampling.LANCZOS).save(target / "ic_launcher.png")
+          PY
+            fi
+          fi
+
+          timeout --foreground 10m flutter pub get
+
+      - name: Build APK with automatic retry
+        if: env.BUILD_MODE != 'doctor'
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          if [ "$BUILD_MODE" = "url" ]; then
+            BUILD_TYPE="release"
+          fi
+
+          build_apk() {
+            if [ "$BUILD_TYPE" = "debug" ]; then
+              timeout --foreground 25m flutter build apk --debug --no-pub
+            else
+              timeout --foreground 25m flutter build apk --release --no-pub
+            fi
+          }
+
+          set +e
+          build_apk
+          FIRST_RESULT=$?
+          set -e
+
+          if [ "$FIRST_RESULT" -ne 0 ]; then
+            echo "Build pertama gagal. Membersihkan cache project lalu mencoba sekali lagi..."
+            flutter clean || true
+            rm -rf .dart_tool build android/.gradle || true
+            flutter precache --android || true
+            timeout --foreground 10m flutter pub get
+            build_apk
+          fi
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+
+          if [ ! -s "$APK_PATH" ]; then
+            APK_PATH="$(find build -type f -name '*.apk' | head -n 1)"
+          fi
+          if [ -z "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
+            echo "APK tidak ditemukan setelah build" >&2
+            exit 40
+          fi
+
+          mkdir -p "$RUNNER_TEMP/build-output"
+          cp "$APK_PATH" "$RUNNER_TEMP/build-output/${JOB_ID}.apk"
+
+          if [ "$BUILD_MODE" = "zip" ]; then
+            export SOURCE_ZIP="$RUNNER_TEMP/build-output/${JOB_ID}-source.zip"
+            python3 - <<'PY'
+          import os, pathlib, zipfile
+
+          project = pathlib.Path(os.environ["PROJECT_DIR"]).resolve()
+          output = pathlib.Path(os.environ["SOURCE_ZIP"]).resolve()
+          ignored_dirs = {
+              ".git", ".dart_tool", "build", ".gradle", ".idea",
+              "node_modules", ".pub-cache", ".vscode"
+          }
+          ignored_files = {".DS_Store"}
+
+          with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+              for item in project.rglob("*"):
+                  relative = item.relative_to(project)
+                  if any(part in ignored_dirs for part in relative.parts):
+                      continue
+                  if item.is_file() and item.name not in ignored_files:
+                      archive.write(item, relative.as_posix())
+          PY
+          fi
+
+      - name: Upload APK and prepared source
+        if: env.BUILD_MODE != 'doctor'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/build-output/*
+          if-no-files-found: error
+          retention-days: 1
