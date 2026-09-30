@@ -1,0 +1,421 @@
+name: KING Build Worker
+run-name: "KING BUILD ${{ inputs.jobId }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Unique build job ID
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: JSON build payload
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: king-build-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD_JSON: ${{ inputs.payload }}
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      JAVA_TOOL_OPTIONS: "-Xmx4g"
+
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmdline-tools;latest'
+
+      - name: Setup Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-home-cache-cleanup: true
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Parse build payload
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, json, os
+          payload = json.loads(os.environ.get("PAYLOAD_JSON", "{}"))
+          mode = str(payload.get("mode", "zip")).strip().lower()
+          if mode not in {"zip", "url", "doctor"}:
+              raise SystemExit(f"Unsupported mode: {mode}")
+          build_type = str(payload.get("buildType", "release")).strip().lower()
+          if build_type not in {"debug", "release"}:
+              build_type = "release"
+          values = {
+              "BUILD_MODE": mode,
+              "BUILD_TYPE": build_type,
+              "SOURCE_URL": str(payload.get("url", "")).strip(),
+              "SOURCE_ASSET_ID": str(payload.get("assetId", "")).strip(),
+              "SOURCE_REPO": str(payload.get("sourceRepo", "")).strip(),
+              "SOURCE_ASSET_NAME_B64": base64.b64encode(str(payload.get("assetName", "project.zip")).encode()).decode(),
+              "ICON_URL": str(payload.get("iconUrl", "")).strip(),
+              "APP_NAME_B64": base64.b64encode(str(payload.get("appName", "KING Web App")).encode()).decode(),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+          PY
+
+      - name: Fast environment check
+        shell: bash
+        run: |
+          flutter --version
+          java -version 2>&1
+          echo "JAVA_HOME=$JAVA_HOME"
+
+      - name: Worker self-test
+        if: env.BUILD_MODE == 'doctor'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/king_worker_test"
+          flutter create --platforms=android --project-name king_worker_test "$RUNNER_TEMP/king_worker_test"
+          cd "$RUNNER_TEMP/king_worker_test"
+          timeout --foreground 8m flutter pub get
+          timeout --foreground 20m flutter build apk --release --no-pub
+          test -s build/app/outputs/flutter-apk/app-release.apk
+          echo "Worker self-test APK berhasil dibuat."
+
+      - name: Download and prepare Flutter project
+        if: env.BUILD_MODE == 'zip'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/king_source"
+          mkdir -p "$RUNNER_TEMP/king_source"
+          rm -f "$RUNNER_TEMP/project.zip"
+
+          if [ -n "$SOURCE_ASSET_ID" ]; then
+            REPO="${SOURCE_REPO:-${{ github.repository }}}"
+            API_URL="https://api.github.com/repos/${REPO}/releases/assets/${SOURCE_ASSET_ID}"
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 5 --retry-delay 2 --retry-max-time 300 \
+              --connect-timeout 30 --max-time 600 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -o "$RUNNER_TEMP/project.zip" "$API_URL"
+          else
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 5 --retry-delay 2 --retry-max-time 300 \
+              --connect-timeout 30 --max-time 600 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -o "$RUNNER_TEMP/project.zip" "$SOURCE_URL"
+          fi
+
+          [ -s "$RUNNER_TEMP/project.zip" ] || { echo "ZIP kosong" >&2; exit 22; }
+
+          if ! unzip -tq "$RUNNER_TEMP/project.zip" >/dev/null; then
+            echo "Bukan ZIP valid" >&2
+            exit 23
+          fi
+
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$RUNNER_TEMP/king_source"
+          PUBSPEC="$(find "$RUNNER_TEMP/king_source" -type f -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)"
+          [ -n "$PUBSPEC" ] || { echo "pubspec.yaml tidak ditemukan" >&2; exit 21; }
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          cd "$PROJECT_DIR"
+          if [ ! -d android ]; then
+            flutter create --platforms=android .
+          fi
+
+      - name: Auto-patch project
+        if: env.BUILD_MODE == 'zip'
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          import os, re, pathlib
+          proj = pathlib.Path(os.environ["PROJECT_DIR"]).resolve()
+
+          # Patch gradle.properties
+          gp = proj / "android" / "gradle.properties"
+          gp.parent.mkdir(parents=True, exist_ok=True)
+          existing = gp.read_text(encoding="utf-8") if gp.exists() else ""
+          additions = []
+          for key, val in [
+              ("org.gradle.jvmargs", "-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError"),
+              ("org.gradle.parallel", "true"),
+              ("org.gradle.caching", "true"),
+              ("org.gradle.daemon", "false"),
+              ("org.gradle.configureondemand", "true"),
+              ("android.useAndroidX", "true"),
+              ("android.enableJetifier", "true"),
+              ("android.enableR8.fullMode", "false"),
+          ]:
+              if key not in existing:
+                  additions.append(f"{key}={val}")
+          if additions:
+              gp.write_text(existing + "\n" + "\n".join(additions) + "\n", encoding="utf-8")
+
+          # Patch build.gradle
+          for bg in [proj / "android" / "app" / "build.gradle",
+                     proj / "android" / "app" / "build.gradle.kts"]:
+              if not bg.exists(): continue
+              txt = bg.read_text(encoding="utf-8")
+              if "namespace" not in txt:
+                  m = re.search(r'applicationId\s*[=]?\s*["\']([^"\']+)["\']', txt)
+                  if m:
+                      app_id = m.group(1)
+                      if bg.suffix == ".kts":
+                          txt = re.sub(r'(android\s*\{)', f'\\1\n    namespace = "{app_id}"', txt, count=1)
+                      else:
+                          txt = re.sub(r'(android\s*\{)', f'\\1\n    namespace "{app_id}"', txt, count=1)
+              txt = re.sub(r'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 21', txt)
+              txt = re.sub(r'minSdkVersion\s+[0-9]+', 'minSdkVersion 21', txt)
+              txt = re.sub(r'minSdk\s*=\s*[0-9]+', 'minSdk = 21', txt)
+              txt = re.sub(r'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 21', txt)
+              txt = re.sub(r'compileSdkVersion\s+flutter\.compileSdkVersion', 'compileSdkVersion 34', txt)
+              txt = re.sub(r'compileSdkVersion\s+[0-9]+', 'compileSdkVersion 34', txt)
+              txt = re.sub(r'compileSdk\s*=\s*[0-9]+', 'compileSdk = 34', txt)
+              txt = re.sub(r'compileSdk\s*=\s*flutter\.compileSdkVersion', 'compileSdk = 34', txt)
+              txt = re.sub(r'targetSdkVersion\s+flutter\.targetSdkVersion', 'targetSdkVersion 34', txt)
+              txt = re.sub(r'targetSdkVersion\s+[0-9]+', 'targetSdkVersion 34', txt)
+              txt = re.sub(r'targetSdk\s*=\s*[0-9]+', 'targetSdk = 34', txt)
+              txt = re.sub(r'targetSdk\s*=\s*flutter\.targetSdkVersion', 'targetSdk = 34', txt)
+              if "ndkVersion" not in txt:
+                  if bg.suffix == ".kts":
+                      txt = re.sub(r'(android\s*\{)', '\\1\n    ndkVersion = "26.1.10909125"', txt, count=1)
+                  else:
+                      txt = re.sub(r'(android\s*\{)', '\\1\n    ndkVersion "26.1.10909125"', txt, count=1)
+              if "multiDexEnabled" not in txt:
+                  txt = re.sub(r'(defaultConfig\s*\{)', '\\1\n        multiDexEnabled true', txt, count=1)
+              bg.write_text(txt, encoding="utf-8")
+          PY
+          cd android && timeout 60s ./gradlew --version 2>/dev/null || true
+
+      - name: Generate WebView application
+        if: env.BUILD_MODE == 'url'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -e
+          [ -n "$SOURCE_URL" ] || { echo "URL website kosong" >&2; exit 30; }
+          APP_DIR="$RUNNER_TEMP/king_webapp"
+          rm -rf "$APP_DIR"
+          flutter create --platforms=android --org com.kingbuild --project-name king_webapp "$APP_DIR"
+          echo "PROJECT_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          cd "$APP_DIR"
+          flutter pub add webview_flutter
+
+          python3 - <<'PY'
+          import base64, html, json, os, pathlib, re
+          project = pathlib.Path(os.environ["RUNNER_TEMP"]) / "king_webapp"
+          app_name = base64.b64decode(os.environ["APP_NAME_B64"]).decode("utf-8", "replace").strip() or "KING Web App"
+          web_url = os.environ["SOURCE_URL"].strip()
+
+          dart = f'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const KingWebApplication());
+          }}
+
+          class KingWebApplication extends StatelessWidget {{
+            const KingWebApplication({{super.key}});
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: {json.dumps(app_name)},
+                theme: ThemeData(useMaterial3: true),
+                home: const KingWebScreen(),
+              );
+            }}
+          }}
+
+          class KingWebScreen extends StatefulWidget {{
+            const KingWebScreen({{super.key}});
+            @override
+            State<KingWebScreen> createState() => _KingWebScreenState();
+          }}
+
+          class _KingWebScreenState extends State<KingWebScreen> {{
+            late final WebViewController controller;
+            int loadingProgress = 0;
+            @override
+            void initState() {{
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onProgress: (value) => setState(() => loadingProgress = value),
+                  ),
+                )
+                ..loadRequest(Uri.parse({json.dumps(web_url)}));
+            }}
+            @override
+            Widget build(BuildContext context) {{
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(controller: controller),
+                      if (loadingProgress < 100)
+                        LinearProgressIndicator(value: loadingProgress / 100),
+                    ],
+                  ),
+                ),
+              );
+            }}
+          }}
+          '''
+          dart = "\n".join(line.lstrip() for line in dart.splitlines()) + "\n"
+          (project / "lib" / "main.dart").write_text(dart, encoding="utf-8")
+
+          mp = project / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+          manifest = mp.read_text(encoding="utf-8")
+          if "android.permission.INTERNET" not in manifest:
+              close = manifest.find(">")
+              manifest = manifest[:close+1] + '\n    <uses-permission android:name="android.permission.INTERNET" />' + manifest[close+1:]
+          manifest = re.sub(r'android:label="[^"]*"', f'android:label="{html.escape(app_name, quote=True)}"', manifest, count=1)
+          mp.write_text(manifest, encoding="utf-8")
+          PY
+
+          if [ -n "$ICON_URL" ]; then
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 3 --retry-max-time 180 \
+              --connect-timeout 30 --max-time 300 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -o "$RUNNER_TEMP/king_icon" "$ICON_URL" || true
+
+            if [ -s "$RUNNER_TEMP/king_icon" ]; then
+              python3 -m pip install --disable-pip-version-check --quiet --user pillow
+              python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageOps
+          import os
+          src = Path(os.environ["RUNNER_TEMP"]) / "king_icon"
+          root = Path(os.environ["RUNNER_TEMP"]) / "king_webapp" / "android" / "app" / "src" / "main" / "res"
+          sizes = {"mipmap-mdpi":48,"mipmap-hdpi":72,"mipmap-xhdpi":96,"mipmap-xxhdpi":144,"mipmap-xxxhdpi":192}
+          image = Image.open(src).convert("RGBA")
+          image = ImageOps.fit(image, (512, 512), method=Image.Resampling.LANCZOS)
+          for folder, size in sizes.items():
+              target = root / folder
+              target.mkdir(parents=True, exist_ok=True)
+              image.resize((size, size), Image.Resampling.LANCZOS).save(target / "ic_launcher.png")
+          PY
+            fi
+          fi
+
+      - name: Pub get
+        if: env.BUILD_MODE != 'doctor'
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Build APK with retry
+        if: env.BUILD_MODE != 'doctor'
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          [ "$BUILD_MODE" = "url" ] && BUILD_TYPE="release"
+
+          build_apk() {
+            local flag="--release"
+            [ "$BUILD_TYPE" = "debug" ] && flag="--debug"
+            timeout --foreground 25m flutter build apk $flag --no-pub
+          }
+
+          set +e
+          build_apk
+          R1=$?
+          set -e
+
+          if [ "$R1" -ne 0 ]; then
+            echo "::warning::Build pertama gagal, clean retry..."
+            flutter clean || true
+            rm -rf .dart_tool build android/.gradle android/app/.cxx 2>/dev/null || true
+            timeout --foreground 8m flutter pub get || true
+            cd android && ./gradlew --stop 2>/dev/null || true && cd ..
+            build_apk
+          fi
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+          [ -s "$APK_PATH" ] || APK_PATH="$(find build -type f -name '*.apk' | head -n 1)"
+          [ -s "$APK_PATH" ] || { echo "APK tidak ditemukan" >&2; exit 40; }
+
+          mkdir -p "$RUNNER_TEMP/build-output"
+          cp "$APK_PATH" "$RUNNER_TEMP/build-output/${JOB_ID}.apk"
+
+          if [ "$BUILD_MODE" = "zip" ]; then
+            export SOURCE_ZIP="$RUNNER_TEMP/build-output/${JOB_ID}-source.zip"
+            python3 - <<'PY'
+          import os, pathlib, zipfile
+          project = pathlib.Path(os.environ["PROJECT_DIR"]).resolve()
+          output = pathlib.Path(os.environ["SOURCE_ZIP"]).resolve()
+          ignored_dirs = {".git",".dart_tool","build",".gradle",".idea","node_modules",".pub-cache",".vscode"}
+          ignored_files = {".DS_Store"}
+          with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+              for item in project.rglob("*"):
+                  relative = item.relative_to(project)
+                  if any(part in ignored_dirs for part in relative.parts): continue
+                  if item.is_file() and item.name not in ignored_files:
+                      archive.write(item, relative.as_posix())
+          PY
+          fi
+
+      - name: Upload artifact
+        if: env.BUILD_MODE != 'doctor'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/build-output/*
+          if-no-files-found: error
+          retention-days: 1
