@@ -1,0 +1,238 @@
+name: KING Web2APK Worker
+run-name: "KING WEB2APK ${{ inputs.jobId }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Job ID
+        required: true
+        type: string
+      webUrl:
+        description: Website URL
+        required: true
+        type: string
+      appName:
+        description: App name
+        required: true
+        type: string
+      iconUrl:
+        description: Icon URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: king-web2apk-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      WEB_URL: ${{ inputs.webUrl }}
+      APP_NAME: ${{ inputs.appName }}
+      ICON_URL: ${{ inputs.iconUrl }}
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      JAVA_TOOL_OPTIONS: "-Xmx4g"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmdline-tools;latest'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-home-cache-cleanup: true
+
+      - name: Accept licenses
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Generate WebView app
+        shell: bash
+        run: |
+          set -e
+          APP_DIR="$RUNNER_TEMP/king_webapp"
+          rm -rf "$APP_DIR"
+          flutter create --platforms=android --org com.kingbuild --project-name king_webapp "$APP_DIR"
+          echo "PROJECT_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          cd "$APP_DIR"
+          flutter pub add webview_flutter
+
+          python3 - <<'PY'
+          import html, json, os, pathlib, re
+          project = pathlib.Path(os.environ["RUNNER_TEMP"]) / "king_webapp"
+          app_name = os.environ["APP_NAME"].strip() or "Web App"
+          web_url = os.environ["WEB_URL"].strip()
+
+          dart = f'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const KingWebApplication());
+          }}
+
+          class KingWebApplication extends StatelessWidget {{
+            const KingWebApplication({{super.key}});
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: {json.dumps(app_name)},
+                theme: ThemeData(useMaterial3: true),
+                home: const KingWebScreen(),
+              );
+            }}
+          }}
+
+          class KingWebScreen extends StatefulWidget {{
+            const KingWebScreen({{super.key}});
+            @override
+            State<KingWebScreen> createState() => _KingWebScreenState();
+          }}
+
+          class _KingWebScreenState extends State<KingWebScreen> {{
+            late final WebViewController controller;
+            int loadingProgress = 0;
+            @override
+            void initState() {{
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onProgress: (value) => setState(() => loadingProgress = value),
+                  ),
+                )
+                ..loadRequest(Uri.parse({json.dumps(web_url)}));
+            }}
+            @override
+            Widget build(BuildContext context) {{
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(controller: controller),
+                      if (loadingProgress < 100)
+                        LinearProgressIndicator(value: loadingProgress / 100),
+                    ],
+                  ),
+                ),
+              );
+            }}
+          }}
+          '''
+          dart = "\n".join(line.lstrip() for line in dart.splitlines()) + "\n"
+          (project / "lib" / "main.dart").write_text(dart, encoding="utf-8")
+
+          mp = project / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+          manifest = mp.read_text(encoding="utf-8")
+          if "android.permission.INTERNET" not in manifest:
+              close = manifest.find(">")
+              manifest = manifest[:close+1] + '\n    <uses-permission android:name="android.permission.INTERNET" />' + manifest[close+1:]
+          manifest = re.sub(r'android:label="[^"]*"', f'android:label="{html.escape(app_name, quote=True)}"', manifest, count=1)
+          mp.write_text(manifest, encoding="utf-8")
+          PY
+
+          if [ -n "$ICON_URL" ]; then
+            curl --fail --silent --show-error --location --http1.1 \
+              --retry 3 --retry-max-time 180 \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -o "$RUNNER_TEMP/king_icon" "$ICON_URL" || true
+
+            if [ -s "$RUNNER_TEMP/king_icon" ]; then
+              python3 -m pip install --disable-pip-version-check --quiet --user pillow
+              python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image, ImageOps
+          import os
+          src = Path(os.environ["RUNNER_TEMP"]) / "king_icon"
+          root = Path(os.environ["RUNNER_TEMP"]) / "king_webapp" / "android" / "app" / "src" / "main" / "res"
+          sizes = {"mipmap-mdpi":48,"mipmap-hdpi":72,"mipmap-xhdpi":96,"mipmap-xxhdpi":144,"mipmap-xxxhdpi":192}
+          image = Image.open(src).convert("RGBA")
+          image = ImageOps.fit(image, (512, 512), method=Image.Resampling.LANCZOS)
+          for folder, size in sizes.items():
+              t = root / folder
+              t.mkdir(parents=True, exist_ok=True)
+              image.resize((size, size), Image.Resampling.LANCZOS).save(t / "ic_launcher.png")
+          PY
+            fi
+          fi
+
+      - name: Patch gradle
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          gp=android/gradle.properties
+          {
+            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g"
+            echo "org.gradle.parallel=true"
+            echo "org.gradle.caching=true"
+            echo "org.gradle.daemon=false"
+            echo "android.useAndroidX=true"
+            echo "android.enableJetifier=true"
+          } >> "$gp"
+
+      - name: Pub get
+        shell: bash
+        timeout-minutes: 10
+        run: cd "$PROJECT_DIR" && flutter pub get
+
+      - name: Build APK
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          build() { timeout --foreground 25m flutter build apk --release --no-pub; }
+          set +e; build; R=$?; set -e
+
+          if [ "$R" -ne 0 ]; then
+            flutter clean || true
+            rm -rf .dart_tool build android/.gradle 2>/dev/null || true
+            timeout 8m flutter pub get || true
+            build
+          fi
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          [ -s "$APK" ] || APK="$(find build -type f -name '*.apk' | head -1)"
+          [ -s "$APK" ] || { echo "APK tidak ditemukan" >&2; exit 40; }
+
+          mkdir -p "$RUNNER_TEMP/build-output"
+          cp "$APK" "$RUNNER_TEMP/build-output/${JOB_ID}.apk"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/build-output/*.apk
+          if-no-files-found: error
+          retention-days: 1
